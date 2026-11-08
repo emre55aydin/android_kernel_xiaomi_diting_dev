@@ -116,6 +116,27 @@ jobs:
             tee "$RUNNER_TEMP/clang-version.txt"
           grep -Fq '12.0.5' "$RUNNER_TEMP/clang-version.txt"
 
+      - name: Canonicalize GKI defconfig using pinned kernel toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$RUNNER_TEMP/ack/build/build-tools/path/linux-x86:$RUNNER_TEMP/ack/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin:$PATH"
+          cd "$GITHUB_WORKSPACE/source"
+          config_out="$RUNNER_TEMP/minimal-config"
+          mkdir -p "$config_out"
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O="$config_out" gki_defconfig
+          for option in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS; do
+            grep -Fqx "CONFIG_${option}=y" "$config_out/.config" || {
+              echo "Missing required kernel setting CONFIG_${option}=y" >&2
+              exit 1
+            }
+          done
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O="$config_out" savedefconfig
+          test -s "$config_out/defconfig"
+          cp "$config_out/defconfig" arch/arm64/configs/gki_defconfig
+          git diff --check
+          echo "Canonical defconfig verified with all five required features enabled."
+
       - name: Prepare swap for memory-heavy ThinLTO build
         run: |
           set -euo pipefail
