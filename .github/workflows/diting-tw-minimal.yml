@@ -72,24 +72,30 @@ jobs:
           done
           python3 - <<'PY'
           from pathlib import Path
-          import re
-          filename = Path("arch/arm64/configs/gki_defconfig")
-          s = filename.read_text()
-          # ONLY mandatory Droidspaces support, no optional NET/NAT,
-          # USER_NS or potentially ABI-breaking CGROUP_PIDS/CFS_BANDWIDTH.
-          names = [
-              "SYSVIPC", "POSIX_MQUEUE", "IPC_NS", "PID_NS",
-              "DEVTMPFS",
-          ]
-          for name in names:
-              pat = rf"(?m)^(?:CONFIG_{name}=.*|# CONFIG_{name} is not set)$"
-              s, count = re.subn(pat, f"CONFIG_{name}=y", s)
-              if not count:
-                  s += f"\nCONFIG_{name}=y\n"
-              if count > 1:
-                  raise SystemExit(f"duplicate Kconfig declaration for {name}")
-          filename.write_text(s)
-          print("Minimal enabled options:", ", ".join(names))
+          p = Path("arch/arm64/configs/gki_defconfig")
+          s = p.read_text()
+          # Preserve the GKI vendor baseline exactly, especially CFI and KASAN.
+          # Kconfig selects IPC_NS and PID_NS by default when available.
+          # Exact positions below reproduce build/build.sh's savedefconfig order.
+          if not s.startswith("CONFIG_AUDIT=y\n"):
+              raise SystemExit("Unexpected GKI baseline start; refusing to edit")
+          if s.count("# CONFIG_PID_NS is not set\n") != 1:
+              raise SystemExit("Unexpected PID_NS baseline; refusing to edit")
+          if s.count("CONFIG_PCI_ENDPOINT=y\n") != 1:
+              raise SystemExit("Unexpected PCI endpoint anchor; refusing to edit")
+          for key in ("CONFIG_CFI_CLANG=y", "CONFIG_KASAN=y", "CONFIG_KASAN_HW_TAGS=y"):
+              if s.count(key + "\n") != 1:
+                  raise SystemExit(f"Required vendor ABI/security setting missing: {key}")
+          s = "CONFIG_SYSVIPC=y\nCONFIG_POSIX_MQUEUE=y\n" + s
+          s = s.replace("# CONFIG_PID_NS is not set\n", "")
+          s = s.replace("CONFIG_PCI_ENDPOINT=y\n",
+                        "CONFIG_PCI_ENDPOINT=y\nCONFIG_DEVTMPFS=y\n")
+          if any("CONFIG_" + name + "=y" in s for name in ("PID_NS","IPC_NS")):
+              raise SystemExit("PID_NS/IPC_NS must use their Kconfig default values")
+          p.write_text(s)
+          print("Enabled SYSVIPC, POSIX_MQUEUE, DEVTMPFS; IPC_NS and PID_NS via Kconfig defaults.")
+          print("Unmodified CFI_CLANG and KASAN_HW_TAGS retained.")
+          PY
           PY
           git diff --check
           git diff --stat
@@ -115,27 +121,6 @@ jobs:
           "$RUNNER_TEMP/ack/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin/clang" --version | \
             tee "$RUNNER_TEMP/clang-version.txt"
           grep -Fq '12.0.5' "$RUNNER_TEMP/clang-version.txt"
-
-      - name: Canonicalize GKI defconfig using pinned kernel toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          export PATH="$RUNNER_TEMP/ack/build/build-tools/path/linux-x86:$RUNNER_TEMP/ack/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin:$PATH"
-          cd "$GITHUB_WORKSPACE/source"
-          config_out="$RUNNER_TEMP/minimal-config"
-          mkdir -p "$config_out"
-          make ARCH=arm64 LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O="$config_out" gki_defconfig
-          for option in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS; do
-            grep -Fqx "CONFIG_${option}=y" "$config_out/.config" || {
-              echo "Missing required kernel setting CONFIG_${option}=y" >&2
-              exit 1
-            }
-          done
-          make ARCH=arm64 LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O="$config_out" savedefconfig
-          test -s "$config_out/defconfig"
-          cp "$config_out/defconfig" arch/arm64/configs/gki_defconfig
-          git diff --check
-          echo "Canonical defconfig verified with all five required features enabled."
 
       - name: Prepare swap for memory-heavy ThinLTO build
         run: |
@@ -174,6 +159,50 @@ jobs:
           DIST_DIR="$RUNNER_TEMP/target-dist" \
             build/build.sh -j"$BUILD_JOBS"
 
+      - name: Save KMI and config evidence even if a build fails
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/diting-tw-diagnostics"
+          mkdir -p "$out"
+          if test -f "$GITHUB_WORKSPACE/source/arch/arm64/configs/gki_defconfig"; then
+            cp "$GITHUB_WORKSPACE/source/arch/arm64/configs/gki_defconfig" "$out/source-gki_defconfig"
+          fi
+          for variant in baseline target; do
+            directory="$RUNNER_TEMP/${variant}-out/common"
+            for source_file in .config Module.symvers abi_symbollist.raw vmlinux.symvers; do
+              if test -f "$directory/$source_file"; then
+                cp "$directory/$source_file" "$out/${variant}-${source_file#.}"
+              fi
+            done
+          done
+          if test -f "$out/baseline-config" && test -f "$out/target-config"; then
+            diff -u "$out/baseline-config" "$out/target-config" > "$out/config-diff.txt" || true
+          fi
+          {
+            echo "Critical vendor symbols; they must be exported by the target vmlinux:"
+            for symbol in __cfi_slowpath kasan_flag_enabled; do
+              echo "== $symbol =="
+              for variant in baseline target; do
+                if test -f "$out/${variant}-Module.symvers"; then
+                  awk -F '\t' -v sym="$symbol" -v variant="$variant" \
+                    '$2 == sym && $3 == "vmlinux" {print variant ": " $0}' "$out/${variant}-Module.symvers"
+                fi
+              done
+            done
+          } > "$out/vendor-critical-symbols.txt"
+          cat "$out/vendor-critical-symbols.txt"
+
+      - name: Upload build diagnostic evidence (no boot images)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diting-taiwan-minimal-diagnostics
+          path: diting-tw-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: REQUIRE exact release and KMI equality; stop on any difference
         shell: bash
         run: |
@@ -183,6 +212,20 @@ jobs:
           cfg="$RUNNER_TEMP/target-out/common/.config"
           for flag in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS; do
             grep -Fqx "CONFIG_${flag}=y" "$cfg" || { echo "CONFIG_${flag} missing!" >&2; exit 1; }
+          done
+          # These two are required by the actual diting vendor modules.
+          for flag in CFI_CLANG KASAN KASAN_HW_TAGS; do
+            grep -Fqx "CONFIG_${flag}=y" "$cfg" || {
+              echo "Vendor ABI-critical CONFIG_${flag}=y missing. STOP: DO NOT FLASH." >&2
+              exit 1
+            }
+          done
+          for symbol in __cfi_slowpath kasan_flag_enabled; do
+            awk -F '\t' -v sym="$symbol" '$2 == sym && $3 == "vmlinux" {found=1} END {exit !found}' \
+              "$RUNNER_TEMP/target-out/common/Module.symvers" || {
+              echo "Vendor-imported exported symbol $symbol missing. STOP: DO NOT FLASH." >&2
+              exit 1
+            }
           done
           if grep -Fqx 'CONFIG_KSU=y' "$cfg"; then
             echo 'Unexpected built-in KernelSU: this build must preserve existing LKM root.' >&2
