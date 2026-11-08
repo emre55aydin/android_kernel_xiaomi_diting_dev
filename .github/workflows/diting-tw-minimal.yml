@@ -96,7 +96,6 @@ jobs:
           print("Enabled SYSVIPC, POSIX_MQUEUE, DEVTMPFS; IPC_NS and PID_NS via Kconfig defaults.")
           print("Unmodified CFI_CLANG and KASAN_HW_TAGS retained.")
           PY
-          PY
           git diff --check
           git diff --stat
 
