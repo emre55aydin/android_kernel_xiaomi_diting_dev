@@ -1,0 +1,206 @@
+name: Diting Taiwan - MINIMAL Droidspaces kernel (no flash)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diting-tw-minimal-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compile-and-check-kmi:
+    name: Compile patched and pristine GKI 5.10.236, compare KMI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      BUILD_JOBS: "2"
+      # Pinned upstream branch snapshots checked during preparation.
+      DITING_BASELINE_SHA: e37858db718debc5c439fe3e1508d080b9338e20
+      DITING_MAIN_SHA: 4fd002583470cedd54170505f0e12eb5b2b100e9
+      EXPECTED_RELEASE: 5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284
+    steps:
+      - name: Checkout small patches from this fork
+        uses: actions/checkout@v4
+        with:
+          path: orchestration
+          persist-credentials: false
+
+      - name: Checkout exactly matched diting baseline source (working copy)
+        uses: actions/checkout@v4
+        with:
+          repository: Dugtx/android_kernel_xiaomi_diting_dev
+          ref: ${{ env.DITING_BASELINE_SHA }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout same baseline source (KMI control)
+        uses: actions/checkout@v4
+        with:
+          repository: Dugtx/android_kernel_xiaomi_diting_dev
+          ref: ${{ env.DITING_BASELINE_SHA }}
+          path: baseline
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout original build manifest pinned by diting maintainer
+        uses: actions/checkout@v4
+        with:
+          repository: Dugtx/android_kernel_xiaomi_diting_dev
+          ref: ${{ env.DITING_MAIN_SHA }}
+          path: metadata
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: |
+            ci/manifest-14313284.xml
+
+      - name: Apply ONLY the required GKI 5.10 IPC ABI fixes and minimum settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          patches="$GITHUB_WORKSPACE/orchestration/.github/diting-minimal"
+          cd "$GITHUB_WORKSPACE/source"
+          for name in \
+            001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch \
+            002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch; do
+            test -s "$patches/$name"
+            patch --dry-run --batch -p1 < "$patches/$name"
+            patch --batch -p1 < "$patches/$name"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          filename = Path("arch/arm64/configs/gki_defconfig")
+          s = filename.read_text()
+          # ONLY mandatory Droidspaces support, no optional NET/NAT,
+          # USER_NS or potentially ABI-breaking CGROUP_PIDS/CFS_BANDWIDTH.
+          names = [
+              "SYSVIPC", "POSIX_MQUEUE", "IPC_NS", "PID_NS",
+              "DEVTMPFS",
+          ]
+          for name in names:
+              pat = rf"(?m)^(?:CONFIG_{name}=.*|# CONFIG_{name} is not set)$"
+              s, count = re.subn(pat, f"CONFIG_{name}=y", s)
+              if not count:
+                  s += f"\nCONFIG_{name}=y\n"
+              if count > 1:
+                  raise SystemExit(f"duplicate Kconfig declaration for {name}")
+          filename.write_text(s)
+          print("Minimal enabled options:", ", ".join(names))
+          PY
+          git diff --check
+          git diff --stat
+
+      - name: Create the precise ACK 14313284 toolchain workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ack"
+          curl --fail --location --retry 3 \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$RUNNER_TEMP/ack/repo"
+          chmod 0755 "$RUNNER_TEMP/ack/repo"
+          cd "$RUNNER_TEMP/ack"
+          ./repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android12-5.10-2025-05 --depth=1
+          cp "$GITHUB_WORKSPACE/metadata/ci/manifest-14313284.xml" \
+            .repo/manifests/default.xml
+          ./repo sync -c --no-tags --prune --optimized-fetch -j4 \
+            build prebuilts-master/clang/host/linux-x86 \
+            prebuilts/build-tools prebuilts/kernel-build-tools
+          "$RUNNER_TEMP/ack/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin/clang" --version | \
+            tee "$RUNNER_TEMP/clang-version.txt"
+          grep -Fq '12.0.5' "$RUNNER_TEMP/clang-version.txt"
+
+      - name: Prepare swap for memory-heavy ThinLTO build
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 16G "$RUNNER_TEMP/diting-swapfile"
+          sudo chmod 0600 "$RUNNER_TEMP/diting-swapfile"
+          sudo mkswap "$RUNNER_TEMP/diting-swapfile"
+          sudo swapon "$RUNNER_TEMP/diting-swapfile"
+          free -h
+          df -h "$RUNNER_TEMP"
+
+      - name: Build unmodified source (control)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ack"
+          ln -s "$GITHUB_WORKSPACE/baseline" common
+          HERMETIC_TOOLCHAIN=0 BUILD_NUMBER=14313284 \
+          KERNEL_DIR=common \
+          BUILD_CONFIG=common/build.config.gki.aarch64 \
+          OUT_DIR="$RUNNER_TEMP/baseline-out" \
+          DIST_DIR="$RUNNER_TEMP/baseline-dist" \
+            build/build.sh -j"$BUILD_JOBS"
+
+      - name: Build minimally patched source (no built-in root)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ack"
+          rm common
+          ln -s "$GITHUB_WORKSPACE/source" common
+          HERMETIC_TOOLCHAIN=0 BUILD_NUMBER=14313284 \
+          KERNEL_DIR=common \
+          BUILD_CONFIG=common/build.config.gki.aarch64 \
+          OUT_DIR="$RUNNER_TEMP/target-out" \
+          DIST_DIR="$RUNNER_TEMP/target-dist" \
+            build/build.sh -j"$BUILD_JOBS"
+
+      - name: REQUIRE exact release and KMI equality; stop on any difference
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${EXPECTED_RELEASE}"
+          strings "$RUNNER_TEMP/target-dist/Image" | grep -m1 -F "Linux version ${expected}"
+          cfg="$RUNNER_TEMP/target-out/common/.config"
+          for flag in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS; do
+            grep -Fqx "CONFIG_${flag}=y" "$cfg" || { echo "CONFIG_${flag} missing!" >&2; exit 1; }
+          done
+          if grep -Fqx 'CONFIG_KSU=y' "$cfg"; then
+            echo 'Unexpected built-in KernelSU: this build must preserve existing LKM root.' >&2
+            exit 1
+          fi
+          for f in vmlinux.symvers abi.xml abi_symbollist; do
+            cmp "$RUNNER_TEMP/baseline-dist/$f" "$RUNNER_TEMP/target-dist/$f" || {
+              echo "KMI mismatch in $f. STOP: DO NOT FLASH." >&2
+              exit 1
+            }
+          done
+          echo 'KMI compared equal to reproducible baseline; NOT a phone-side test.'
+
+      - name: Package IMAGE FOR REVIEW ONLY, never flash anything
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/diting-tw-kernel-review"
+          mkdir -p "$dir"
+          for f in Image Image.lz4 vmlinux.symvers abi.xml abi_symbollist; do
+            cp "$RUNNER_TEMP/target-dist/$f" "$dir/$f"
+          done
+          cp "$RUNNER_TEMP/target-out/common/.config" "$dir/kernel.config"
+          {
+            echo "release=$EXPECTED_RELEASE"
+            echo "source_repo=Dugtx/android_kernel_xiaomi_diting_dev"
+            echo "source_sha=$DITING_BASELINE_SHA"
+            echo "manifest_sha=$DITING_MAIN_SHA"
+            echo 'root=none-built-in; preserve existing ksuinit + kernelsu.ko RAMDISK'
+            echo 'target_rom=OS3.0.5.0.VLFTWXM (NOT hardware validated)'
+            echo 'KMI=equal to clean baseline artifacts, NOT yet to Taiwan vendor modules'
+            echo 'status=NO FLASH - inspect with ChatGPT before attempting any repack'
+          } > "$dir/PROVENANCE.txt"
+          (cd "$dir" && sha256sum * > SHA256SUMS)
+
+      - name: Upload review artifacts (NO boot image)
+        uses: actions/upload-artifact@v4
+        with:
+          name: diting-taiwan-minimal-droidspaces-review
+          path: diting-tw-kernel-review/
+          if-no-files-found: error
+          retention-days: 14
