@@ -1,0 +1,97 @@
+name: Diting Taiwan - QUICK known-good kernel rollback TWRP ZIP
+
+on:
+  push:
+    branches:
+      - experiment/diting-tw-gki-full-safe-20261114
+    paths:
+      - .github/workflows/diting-tw-rollback.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package-proven-working-kernel:
+    name: Package old boot-tested Image with pinned AnyKernel3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pinned recovery installer
+        uses: actions/checkout@v4
+        with:
+          repository: osm0sis/AnyKernel3
+          ref: 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+          path: ak3
+          persist-credentials: false
+
+      - name: Download previously tested kernel Image
+        uses: actions/download-artifact@v4
+        with:
+          name: diting-taiwan-minimal-droidspaces-review
+          run-id: 42532478656
+          github-token: ${{ github.token }}
+          path: known-good
+
+      - name: Build TWRP ZIP and verify provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd known-good && sha256sum -c SHA256SUMS)
+          echo '3b509f60d380df8b04fafec0902624a5b0c7dbcee6f0d216297c32349c67db2e  known-good/Image' | sha256sum -c -
+          grep -Fq '5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284' known-good/PROVENANCE.txt
+          mkdir -p "$RUNNER_TEMP/rollback" "$GITHUB_WORKSPACE/twrp-rollback"
+          cp -a ak3/. "$RUNNER_TEMP/rollback/"
+          work="$RUNNER_TEMP/rollback"
+          rm -rf "$work/.git" "$work/.github" "$work/modules" "$work/patch" "$work/ramdisk"
+          cp known-good/Image "$work/Image"
+          cat > "$work/anykernel.sh" <<'ANYKERNEL'
+          #!/sbin/sh
+          # Recovery: previously boot-tested kernel, preserve existing ramdisk/root.
+          properties() { '
+          kernel.string=Diting-Taiwan-previous-working-5.10.236-Droidspaces
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=diting
+          supported.versions=15
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          BLOCK=boot
+          IS_SLOT_DEVICE=1
+          RAMDISK_COMPRESSION=auto
+          PATCH_VBMETA_FLAG=auto
+          . tools/ak3-core.sh
+          split_boot
+          flash_boot
+          ANYKERNEL
+          chmod 755 "$work/anykernel.sh"
+          sh -n "$work/anykernel.sh"
+          test -s "$work/tools/ak3-core.sh"
+          test -s "$work/META-INF/com/google/android/update-binary"
+          output="$GITHUB_WORKSPACE/twrp-rollback/DITING_TW_PREVIOUS_WORKING_KERNEL_ROLLBACK_TWRP.zip"
+          (cd "$work" && zip -qr9 "$output" .)
+          unzip -tq "$output"
+          (cd "$GITHUB_WORKSPACE/twrp-rollback" && sha256sum *.zip > SHA256SUMS)
+          cat > "$GITHUB_WORKSPACE/twrp-rollback/READ_ME_FIRST.txt" <<'NOTE'
+          USER DEVICE: Xiaomi 12T Pro (diting), Taiwan HyperOS 3 Android 15.
+          RESTORES: previously boot-tested GKI 5.10.236 kernel Image from
+          workflow 42532478656, sha256 3b509f60d380df8b04fafec0902624a5b0c7dbcee6f0d216297c32349c67db2e.
+          Preserves existing boot ramdisk (including KernelSU LKM).
+          This AnyKernel3 ZIP itself is NOT tested on the device.
+          KEEP separate full boot_a_ORIJINAL.img and existing TWRP boot_a
+          restore ZIP; unlike a full boot restore this does not reset ramdisk.
+          Never flash on a different ROM or device; do not relock bootloader.
+          NOTE
+
+      - name: Upload full TWRP rollback ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: diting-tw-previous-working-kernel-rollback-twrp
+          path: twrp-rollback/
+          if-no-files-found: error
+          retention-days: 30
