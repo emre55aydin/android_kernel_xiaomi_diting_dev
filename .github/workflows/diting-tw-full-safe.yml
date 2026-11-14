@@ -102,9 +102,9 @@ jobs:
           # Enabling a flag is NOT proof of ABI safety; the build gate below MUST pass.
           extras = ["NETFILTER_XT_MATCH_ADDRTYPE","USER_NS","IP6_NF_NAT","IP6_NF_TARGET_MASQUERADE","MACVLAN","NETFILTER_XT_TARGET_LOG","NETFILTER_XT_MATCH_RECENT","IP_SET","IP_SET_HASH_IP","IP_SET_HASH_NET","NETFILTER_XT_SET","TMPFS_POSIX_ACL","TMPFS_XATTR"]
           for flag in extras:
-              present = "CONFIG_" + flag + "=y\\n"
-              disabled = "# CONFIG_" + flag + " is not set\\n"
-              module = "CONFIG_" + flag + "=m\\n"
+              present = "CONFIG_" + flag + "=y\n"
+              disabled = "# CONFIG_" + flag + " is not set\n"
+              module = "CONFIG_" + flag + "=m\n"
               if present in s:
                   continue
               if disabled in s:
@@ -112,10 +112,10 @@ jobs:
               elif module in s:
                   s = s.replace(module, present)
               else:
-                  s += "\\n" + present
+                  s += "\n" + present
           # NEVER enable these GKI ABI-breaking resource-limit flags.
           for forbidden in ("CFS_BANDWIDTH", "CGROUP_PIDS"):
-              if "CONFIG_" + forbidden + "=y\\n" in s:
+              if "CONFIG_" + forbidden + "=y\n" in s:
                   raise SystemExit("GKI ABI-dangerous setting: " + forbidden)
           p.write_text(s)
           print("Enabled original minimum settings and KMI-gated optional flags:", ", ".join(extras))
