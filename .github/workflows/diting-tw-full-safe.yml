@@ -1,0 +1,394 @@
+name: Diting Taiwan - FULL SAFE GKI Docker/Namespaces (KMI-gated)
+
+on:
+  push:
+    branches:
+      - experiment/diting-tw-gki-full-safe-20261114
+    paths:
+      - .github/workflows/diting-tw-full-safe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diting-tw-full-safe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compile-and-check-kmi:
+    name: Compile patched and pristine GKI 5.10.236, compare KMI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      BUILD_JOBS: "2"
+      # Pinned upstream branch snapshots checked during preparation.
+      DITING_BASELINE_SHA: e37858db718debc5c439fe3e1508d080b9338e20
+      DITING_MAIN_SHA: 4fd002583470cedd54170505f0e12eb5b2b100e9
+      EXPECTED_RELEASE: 5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284
+    steps:
+      - name: Checkout small patches from this fork
+        uses: actions/checkout@v4
+        with:
+          path: orchestration
+          persist-credentials: false
+
+      - name: Checkout exactly matched diting baseline source (working copy)
+        uses: actions/checkout@v4
+        with:
+          repository: Dugtx/android_kernel_xiaomi_diting_dev
+          ref: ${{ env.DITING_BASELINE_SHA }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout same baseline source (KMI control)
+        uses: actions/checkout@v4
+        with:
+          repository: Dugtx/android_kernel_xiaomi_diting_dev
+          ref: ${{ env.DITING_BASELINE_SHA }}
+          path: baseline
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout original build manifest pinned by diting maintainer
+        uses: actions/checkout@v4
+        with:
+          repository: Dugtx/android_kernel_xiaomi_diting_dev
+          ref: ${{ env.DITING_MAIN_SHA }}
+          path: metadata
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: |
+            ci/manifest-14313284.xml
+
+      - name: Apply KMI-safe GKI baseline fixes + carefully gated full Linux features
+        shell: bash
+        run: |
+          set -euo pipefail
+          patches="$GITHUB_WORKSPACE/orchestration/.github/diting-minimal"
+          cd "$GITHUB_WORKSPACE/source"
+          for name in \
+            001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch \
+            002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch; do
+            test -s "$patches/$name"
+            patch --dry-run --batch -p1 < "$patches/$name"
+            patch --batch -p1 < "$patches/$name"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("arch/arm64/configs/gki_defconfig")
+          s = p.read_text()
+          # Preserve the GKI vendor baseline exactly, especially CFI and KASAN.
+          # Kconfig selects IPC_NS and PID_NS by default when available.
+          # Exact positions below reproduce build/build.sh's savedefconfig order.
+          if not s.startswith("CONFIG_AUDIT=y\n"):
+              raise SystemExit("Unexpected GKI baseline start; refusing to edit")
+          if s.count("# CONFIG_PID_NS is not set\n") != 1:
+              raise SystemExit("Unexpected PID_NS baseline; refusing to edit")
+          if s.count("CONFIG_PCI_ENDPOINT=y\n") != 1:
+              raise SystemExit("Unexpected PCI endpoint anchor; refusing to edit")
+          for key in ("CONFIG_CFI_CLANG=y", "CONFIG_KASAN=y", "CONFIG_KASAN_HW_TAGS=y"):
+              if s.count(key + "\n") != 1:
+                  raise SystemExit(f"Required vendor ABI/security setting missing: {key}")
+          s = "CONFIG_SYSVIPC=y\nCONFIG_POSIX_MQUEUE=y\n" + s
+          s = s.replace("# CONFIG_PID_NS is not set\n", "")
+          s = s.replace("CONFIG_PCI_ENDPOINT=y\n",
+                        "CONFIG_PCI_ENDPOINT=y\nCONFIG_DEVTMPFS=y\n")
+          if any("CONFIG_" + name + "=y" in s for name in ("PID_NS","IPC_NS")):
+              raise SystemExit("PID_NS/IPC_NS must use their Kconfig default values")
+          # Extra features documented for GKI by Droidspaces upstream.
+          # Enabling a flag is NOT proof of ABI safety; the build gate below MUST pass.
+          extras = ["NETFILTER_XT_MATCH_ADDRTYPE","USER_NS","IP6_NF_NAT","IP6_NF_TARGET_MASQUERADE","MACVLAN","NETFILTER_XT_TARGET_LOG","NETFILTER_XT_MATCH_RECENT","IP_SET","IP_SET_HASH_IP","IP_SET_HASH_NET","NETFILTER_XT_SET","TMPFS_POSIX_ACL","TMPFS_XATTR"]
+          for flag in extras:
+              present = "CONFIG_" + flag + "=y\\n"
+              disabled = "# CONFIG_" + flag + " is not set\\n"
+              module = "CONFIG_" + flag + "=m\\n"
+              if present in s:
+                  continue
+              if disabled in s:
+                  s = s.replace(disabled, present)
+              elif module in s:
+                  s = s.replace(module, present)
+              else:
+                  s += "\\n" + present
+          # NEVER enable these GKI ABI-breaking resource-limit flags.
+          for forbidden in ("CFS_BANDWIDTH", "CGROUP_PIDS"):
+              if "CONFIG_" + forbidden + "=y\\n" in s:
+                  raise SystemExit("GKI ABI-dangerous setting: " + forbidden)
+          p.write_text(s)
+          print("Enabled original minimum settings and KMI-gated optional flags:", ", ".join(extras))
+          print("Unmodified CFI_CLANG and KASAN_HW_TAGS retained.")
+          PY
+          git diff --check
+          git diff --stat
+
+      - name: Create the precise ACK 14313284 toolchain workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ack"
+          curl --fail --location --retry 3 \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$RUNNER_TEMP/ack/repo"
+          chmod 0755 "$RUNNER_TEMP/ack/repo"
+          cd "$RUNNER_TEMP/ack"
+          ./repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android12-5.10-2025-05 --depth=1
+          cp "$GITHUB_WORKSPACE/metadata/ci/manifest-14313284.xml" \
+            .repo/manifests/default.xml
+          ./repo sync -c --no-tags --prune --optimized-fetch -j4 \
+            build prebuilts-master/clang/host/linux-x86 \
+            prebuilts/build-tools prebuilts/kernel-build-tools
+          "$RUNNER_TEMP/ack/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin/clang" --version | \
+            tee "$RUNNER_TEMP/clang-version.txt"
+          grep -Fq '12.0.5' "$RUNNER_TEMP/clang-version.txt"
+
+      - name: Prepare swap for memory-heavy ThinLTO build
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 16G "$RUNNER_TEMP/diting-swapfile"
+          sudo chmod 0600 "$RUNNER_TEMP/diting-swapfile"
+          sudo mkswap "$RUNNER_TEMP/diting-swapfile"
+          sudo swapon "$RUNNER_TEMP/diting-swapfile"
+          free -h
+          df -h "$RUNNER_TEMP"
+
+      - name: Build unmodified source (control)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ack"
+          ln -s "$GITHUB_WORKSPACE/baseline" common
+          HERMETIC_TOOLCHAIN=0 BUILD_NUMBER=14313284 \
+          KERNEL_DIR=common \
+          BUILD_CONFIG=common/build.config.gki.aarch64 \
+          OUT_DIR="$RUNNER_TEMP/baseline-out" \
+          DIST_DIR="$RUNNER_TEMP/baseline-dist" \
+            build/build.sh -j"$BUILD_JOBS"
+
+      - name: Build minimally patched source (no built-in root)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/ack"
+          rm common
+          ln -s "$GITHUB_WORKSPACE/source" common
+          HERMETIC_TOOLCHAIN=0 BUILD_NUMBER=14313284 \
+          KERNEL_DIR=common \
+          BUILD_CONFIG=common/build.config.gki.aarch64 \
+          OUT_DIR="$RUNNER_TEMP/target-out" \
+          DIST_DIR="$RUNNER_TEMP/target-dist" \
+            build/build.sh -j"$BUILD_JOBS"
+
+      - name: Save KMI and config evidence even if a build fails
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/diting-tw-diagnostics"
+          mkdir -p "$out"
+          if test -f "$GITHUB_WORKSPACE/source/arch/arm64/configs/gki_defconfig"; then
+            cp "$GITHUB_WORKSPACE/source/arch/arm64/configs/gki_defconfig" "$out/source-gki_defconfig"
+          fi
+          for variant in baseline target; do
+            directory="$RUNNER_TEMP/${variant}-out/common"
+            for source_file in .config Module.symvers abi_symbollist.raw vmlinux.symvers; do
+              if test -f "$directory/$source_file"; then
+                cp "$directory/$source_file" "$out/${variant}-${source_file#.}"
+              fi
+            done
+          done
+          if test -f "$out/baseline-config" && test -f "$out/target-config"; then
+            diff -u "$out/baseline-config" "$out/target-config" > "$out/config-diff.txt" || true
+          fi
+          {
+            echo "Critical vendor symbols; they must be exported by the target vmlinux:"
+            for symbol in __cfi_slowpath kasan_flag_enabled; do
+              echo "== $symbol =="
+              for variant in baseline target; do
+                if test -f "$out/${variant}-Module.symvers"; then
+                  awk -F '\t' -v sym="$symbol" -v variant="$variant" \
+                    '$2 == sym && $3 == "vmlinux" {print variant ": " $0}' "$out/${variant}-Module.symvers"
+                fi
+              done
+            done
+          } > "$out/vendor-critical-symbols.txt"
+          cat "$out/vendor-critical-symbols.txt"
+
+      - name: Upload build diagnostic evidence (no boot images)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diting-taiwan-full-safe-diagnostics
+          path: diting-tw-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: REQUIRE exact release and KMI equality; stop on any difference
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${EXPECTED_RELEASE}"
+          strings "$RUNNER_TEMP/target-dist/Image" | grep -m1 -F "Linux version ${expected}"
+          cfg="$RUNNER_TEMP/target-out/common/.config"
+          for flag in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE USER_NS IP6_NF_NAT IP6_NF_TARGET_MASQUERADE MACVLAN NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET TMPFS_POSIX_ACL TMPFS_XATTR; do
+            grep -Fqx "CONFIG_${flag}=y" "$cfg" || { echo "CONFIG_${flag} missing!" >&2; exit 1; }
+          done
+          for forbidden in CFS_BANDWIDTH CGROUP_PIDS; do
+            if grep -Fqx "CONFIG_${forbidden}=y" "$cfg"; then
+              echo "ABI-unsafe option CONFIG_${forbidden} unexpectedly enabled" >&2
+              exit 1
+            fi
+          done
+          # These two are required by the actual diting vendor modules.
+          for flag in CFI_CLANG KASAN KASAN_HW_TAGS; do
+            grep -Fqx "CONFIG_${flag}=y" "$cfg" || {
+              echo "Vendor ABI-critical CONFIG_${flag}=y missing. STOP: DO NOT FLASH." >&2
+              exit 1
+            }
+          done
+          for symbol in __cfi_slowpath kasan_flag_enabled; do
+            awk -F '\t' -v sym="$symbol" '$2 == sym && $3 == "vmlinux" {found=1} END {exit !found}' \
+              "$RUNNER_TEMP/target-out/common/Module.symvers" || {
+              echo "Vendor-imported exported symbol $symbol missing. STOP: DO NOT FLASH." >&2
+              exit 1
+            }
+          done
+          if grep -Fqx 'CONFIG_KSU=y' "$cfg"; then
+            echo 'Unexpected built-in KernelSU: this build must preserve existing LKM root.' >&2
+            exit 1
+          fi
+          for f in vmlinux.symvers abi.xml abi_symbollist; do
+            cmp "$RUNNER_TEMP/baseline-dist/$f" "$RUNNER_TEMP/target-dist/$f" || {
+              echo "KMI mismatch in $f. STOP: DO NOT FLASH." >&2
+              exit 1
+            }
+          done
+          echo 'KMI compared equal to reproducible baseline; NOT a phone-side test.'
+
+      - name: Package IMAGE FOR REVIEW ONLY, never flash anything
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/diting-tw-full-safe-kernel-review"
+          mkdir -p "$dir"
+          for f in Image Image.lz4 vmlinux.symvers abi.xml abi_symbollist; do
+            cp "$RUNNER_TEMP/target-dist/$f" "$dir/$f"
+          done
+          cp "$RUNNER_TEMP/target-out/common/.config" "$dir/kernel.config"
+          {
+            echo "release=$EXPECTED_RELEASE"
+            echo "source_repo=Dugtx/android_kernel_xiaomi_diting_dev"
+            echo "source_sha=$DITING_BASELINE_SHA"
+            echo "manifest_sha=$DITING_MAIN_SHA"
+            echo 'root=none-built-in; preserve existing ksuinit + kernelsu.ko RAMDISK'
+            echo 'target_rom=OS3.0.5.0.VLFTWXM (NOT hardware validated)'
+            echo 'KMI=equal to clean baseline artifacts, NOT yet to Taiwan vendor modules'
+            echo 'status=KMI-CHECKED CANDIDATE - NOT DEVICE TESTED - USE TWRP RECOVERY'
+          } > "$dir/PROVENANCE.txt"
+          (cd "$dir" && sha256sum * > SHA256SUMS)
+
+      - name: Upload review artifacts (NO boot image)
+        uses: actions/upload-artifact@v4
+        with:
+          name: diting-taiwan-full-safe-droidspaces-review
+          path: diting-tw-full-safe-kernel-review/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fetch fixed AnyKernel3 template
+        uses: actions/checkout@v4
+        with:
+          repository: osm0sis/AnyKernel3
+          ref: 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+          path: anykernel3-pinned
+          persist-credentials: false
+
+      - name: Fetch previously boot-tested working kernel artifact for rollback
+        uses: actions/download-artifact@v4
+        with:
+          name: diting-taiwan-minimal-droidspaces-review
+          run-id: 42532478656
+          github-token: ${{ github.token }}
+          path: known-good-kernel
+
+      - name: Create candidate and working-kernel rollback TWRP flash ZIPs
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd known-good-kernel && sha256sum --check SHA256SUMS)
+          test -s known-good-kernel/Image
+          test -s "$RUNNER_TEMP/target-dist/Image"
+          test -s anykernel3-pinned/tools/ak3-core.sh
+          out="$GITHUB_WORKSPACE/diting-tw-full-safe-twrp-zips"
+          mkdir -p "$out"
+          for kind in candidate working-rollback; do
+            work="$RUNNER_TEMP/ak3-$kind"
+            mkdir -p "$work"
+            cp -a anykernel3-pinned/. "$work/"
+            rm -rf "$work/.git" "$work/.github"
+            if test "$kind" = candidate; then
+              cp "$RUNNER_TEMP/target-dist/Image" "$work/Image"
+              name="DITING_TW_GKI_FULL_SAFE_CANDIDATE_UNTESTED.zip"
+            else
+              cp "$GITHUB_WORKSPACE/known-good-kernel/Image" "$work/Image"
+              name="DITING_TW_ROLLBACK_PREVIOUS_WORKING_KERNEL.zip"
+            fi
+            cat > "$work/anykernel.sh" <<'ANYKERNEL'
+          #!/sbin/sh
+          # Diting Taiwan HyperOS 3 Android 15: kernel-only AnyKernel3 installer
+          properties() { '
+          kernel.string=Diting-Taiwan-5.10.236-Droidspaces-GKI-KMI-gated
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=diting
+          supported.versions=15
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          BLOCK=boot
+          IS_SLOT_DEVICE=1
+          RAMDISK_COMPRESSION=auto
+          PATCH_VBMETA_FLAG=auto
+          . tools/ak3-core.sh
+          split_boot
+          flash_boot
+          ANYKERNEL
+            chmod 755 "$work/anykernel.sh"
+            sh -n "$work/anykernel.sh"
+            test -s "$work/Image"
+            # Do not ship git metadata, demo modules, or example ramdisk scripts
+            rm -rf "$work/modules" "$work/patch" "$work/ramdisk"
+            (cd "$work" && zip -q -r -9 "$out/$name" .)
+            unzip -tq "$out/$name"
+            unzip -l "$out/$name" | grep -F 'anykernel.sh'
+            unzip -l "$out/$name" | grep -F 'Image'
+            echo "Validated ZIP: $name"
+          done
+          (cd "$out" && sha256sum *.zip > SHA256SUMS)
+          cat > "$out/READ-BEFORE-FLASH.txt" <<'NOTE'
+          EXPERIMENTAL - DO NOT AUTO-FLASH. Designed for diting / Android 15.
+          Candidate is KMI-gated to pristine GKI but NOT phone-tested.
+          Check kernel, root, phone service, camera, wifi, and Droidspaces after boot.
+          ZIPs replace only the kernel using AnyKernel3 (boot ramdisk left as-is).
+          Working rollback uses Image from successful run 42532478656.
+          Full original boot_a restore: keep existing OS3.0.5.0.VLFTWXM
+          ROM-matched boot_a_ORIJINAL.img and TWRP backup separately.
+          If the phone fails to boot, restore the known-good original boot_a
+          from TWRP or fastboot; do not lock the bootloader.
+          Never flash if the current ROM, partition layout or slot differs.
+          NOTE
+
+      - name: Upload test candidate and known-good rollback ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: diting-tw-full-safe-twrp-and-rollback-zips
+          path: diting-tw-full-safe-twrp-zips/
+          if-no-files-found: error
+          retention-days: 30
