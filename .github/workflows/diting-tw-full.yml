@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: diting-tw-full-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   compile-and-check-kmi:
@@ -282,7 +282,7 @@ jobs:
           done
           echo 'KMI compared equal to reproducible baseline; NOT a phone-side test.'
 
-      - name: Package IMAGE FOR REVIEW ONLY, never flash anything
+      - name: Package compiled kernel Image, config and provenance
         shell: bash
         run: |
           set -euo pipefail
@@ -304,13 +304,6 @@ jobs:
           } > "$dir/PROVENANCE.txt"
           (cd "$dir" && sha256sum * > SHA256SUMS)
 
-      - name: Upload review artifacts (NO boot image)
-        uses: actions/upload-artifact@v4
-        with:
-          name: diting-taiwan-full-droidspaces-review
-          path: diting-tw-kernel-review/
-          if-no-files-found: error
-          retention-days: 14
 
       - name: Package experimental AnyKernel3 TWRP ZIP - preserve existing ramdisk
         shell: bash
@@ -372,3 +365,11 @@ jobs:
           unzip -l "$output" | grep -E 'anykernel.sh|Image.lz4|ak3-core.sh|update-binary'
           sha256sum "$output" > "$output.sha256"
           cp "$GITHUB_WORKSPACE/orchestration/scripts/ci/diting_build_rollback_zip.py" "$GITHUB_WORKSPACE/diting-tw-kernel-review/"
+
+      - name: Upload kernel review and experimental AnyKernel3 TWRP ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: diting-taiwan-full-droidspaces-review
+          path: diting-tw-kernel-review/
+          if-no-files-found: error
+          retention-days: 14
